@@ -74,3 +74,39 @@ The re-request is therefore relocated to the `closedCallback`, where kotlin actu
 This matters specifically for transport-enabled nodes: reticulum-kt's `Transport.deregisterLink` stale-path recovery (expire + re-request on pending-link timeout) is intentionally gated to non-transport nodes (Python `Transport.py:504` parity), so for transport-mode users the LXMF close-time re-request is the only mechanism that refreshes a stale path after a failed DIRECT link.
 
 **Re-evaluation:** If the kotlin `LXMRouter` ever stops eagerly removing the link in `closedCallback` and instead lets `processDirectDelivery` observe and pop CLOSED links (matching Python's `direct_links` lifecycle), move the re-request back into the CLOSED branch and delete this deviation. The per-message `pathRequestRetried` semantics would then align 1:1 with Python without the close-event approximation.
+
+### `LXMessage.send()` delegates to an LXMRouter-owned hook — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMessage.kt::send`
+
+**Python reference:** `LXMF/LXMF/LXMessage.py:463-508` — `send()` synthesises `RNS.Packet`/`RNS.Resource` objects directly from inside the message class (`__as_packet`, `__as_resource`) and drives state transitions (`SENDING`/`SENT`, progress 0.10/0.50, delivery/timeout callbacks) itself.
+
+**Category:** architecture (port-forced)
+
+**Date:** 2026-08-23
+
+**Description:** In this port all packet/resource synthesis and lifecycle wiring lives in `LXMRouter` (`sendViaLink`, opportunistic path, `sendViaPropagation`); `LXMessage.send()` performs Python's pre-send annotations (`determine_transport_encryption()` + `determine_compression_support()`, both ported verbatim including the OPPORTUNISTIC/DIRECT/PROPAGATED/PAPER × SINGLE/GROUP matrix) and then delegates actual transmission to a router-registered hook. Without a registered hook the message is marked `FAILED` and `failed_callback` fires — Python would instead raise on a null `__delivery_destination` inside `__as_packet`. The delegation keeps one owner for link teardown/retry semantics that this port's event-driven router already implements (see the DIRECT-link CLOSED-branch deviation below), avoiding two competing send paths.
+
+**Re-evaluation:** If the router ever grows a pass-through registration API where callers wire raw RNS destinations per-message, `send()` could synthesise packets directly again; revisit only if a use-case appears that needs message-class-level sending without any router.
+
+### `set_destination` / `set_source` are validation-only — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMessage.kt::setDestination` / `::setSource`
+
+**Python reference:** `LXMF/LXMF/LXMessage.py:235-242` and `255-262` — name-mangled private fields rebindable once; later assignment raises.
+
+**Category:** language-forced
+
+**Date:** 2026-08-23
+
+**Description:** This port declares `destination`/`source` as immutable constructor properties (`val`), which every existing call site (router, tests, bridge) already relies on. `setDestination`/`setSource` therefore replicate Python's *contract* — reject non-SINGLE destinations, reject reassignment with the same exception types/messages — but cannot rebind the property when it is still null on an outbound message constructed via `create()` (where both are always supplied anyway). For receive-side messages (`unpackFromBytes`) the properties are null and validation-only semantics are observable: a null/non-SINGLE argument throws `IllegalArgumentException`, a second valid call throws `IllegalStateException`.
+
+**Re-evaluation:** If Kotlin-side code ever needs late destination binding (e.g. deferred resolution of an incoming sender into a `Destination` object), migrate the backing storage to `private var` + public `val` accessors and let these setters perform the actual rebind, deleting this deviation.
+
+### `as_qr()` returns the URI payload contract, not a rendered image — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMessage.kt::asQr`
+
+**Python reference:** `LXMF/LXMF/LXMessage.py:718-744` — renders via the optional `qrcode` module and returns a PIL image; returns None (with critical log) when the module is missing.
+
+**Category:** dependency-forced
+
+**Date:** 2026-08-23
+
+**Description:** The JVM core deliberately does not bundle a QR renderer or an image type. `asQr()` mirrors Python's missing-dependency branch: it validates paper packing (throwing `IllegalStateException` on non-paper messages exactly like Python's `TypeError`) and returns null after logging that a renderer is required, directing callers to use `asUri()` output as the QR payload. Android/app consumers attach their own ZXing-based renderer; keeping the image type out of `-core` avoids pinning java.awt/pixel classes into an Android-consumable artifact.
+
+**Re-evaluation:** If a JVM-wide standard QR type becomes available in the dependency tree (e.g. a multiplatform qrcode artifact), add an optional `zxing`/`qrcode-multiformat` scoped dependency and return a real image behind a separate `asQrImage()` while keeping this method as the payload accessor.

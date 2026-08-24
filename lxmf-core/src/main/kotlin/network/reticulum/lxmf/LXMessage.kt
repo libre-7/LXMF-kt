@@ -2,6 +2,7 @@ package network.reticulum.lxmf
 
 import network.reticulum.common.toHexString
 import network.reticulum.crypto.Hashes
+import network.reticulum.common.DestinationType
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import org.msgpack.core.MessagePack
@@ -617,6 +618,500 @@ class LXMessage private constructor(
 
         method = DeliveryMethod.PAPER
         representation = MessageRepresentation.PACKET
+    }
+
+    // ===== Parity additions (Python LXMessage.py 1.1.0) =====
+
+    /** Stamp generated for propagation-node delivery (Python `propagation_stamp`). */
+    var propagationStamp: ByteArray? = null
+
+    /** Value (leading zero bits) of the propagation stamp (Python `propagation_stamp_value`). */
+    var propagationStampValue: Int? = null
+
+    /** Whether the propagation stamp has been generated and validated. */
+    var propagationStampValid: Boolean = false
+
+    /** Target stamp cost announced by the selected propagation node. */
+    var propagationTargetCost: Int? = null
+
+    /** Whether this message supports compression on Resource transfer (Python `auto_compress`). */
+    var autoCompress: Boolean = true
+
+    /** Ratchet ID of the destination used for encrypted transfer (Python `ratchet_id`). */
+    var ratchetId: ByteArray? = null
+
+    /** Whether the source identity of an incoming message is blackholed. */
+    var sourceBlackholed: Boolean = false
+
+    /** Packed container bytes for propagation-node transfer (Python `propagation_packed`). */
+    var propagationPacked: ByteArray? = null
+
+    /** Delivery destination - may differ from [destination] when set via a router (Python `__delivery_destination`). */
+    var deliveryDestination: Destination? = null
+        private set
+
+    /**
+     * Set title from a String (Python `set_title_from_string`, LXMessage.py:193).
+     * Kotlin stores title as String already; assignment is direct, matching
+     * [setTitleFromBytes] which decodes before assigning.
+     */
+    fun setTitleFromString(titleString: String) {
+        title = titleString
+    }
+
+    /**
+     * Get title as a decoded String (Python `title_as_string`, LXMessage.py:199).
+     * Identity accessor provided for API parity.
+     */
+    fun titleAsString(): String = title
+
+    /**
+     * Set content from a String (Python `set_content_from_string`, LXMessage.py:202).
+     */
+    fun setContentFromString(contentString: String) {
+        content = contentString
+    }
+
+    /**
+     * Get content as a decoded String (Python `content_as_string`, LXMessage.py:208).
+     * Returns null if the stored content cannot round-trip through UTF-8
+     * (unpaired surrogates), mirroring Python returning None on decode failure.
+     */
+    fun contentAsString(): String? {
+        return try {
+            val bytes = content.toByteArray(Charsets.UTF_8)
+            val decoded = String(bytes, Charsets.UTF_8)
+            if (decoded == content) decoded else null
+        } catch (e: Exception) {
+            println("$this could not decode message content as string: $e")
+            null
+        }
+    }
+
+    /**
+     * Replace the fields dictionary (Python `set_fields`, LXMessage.py:215-219).
+     * Accepts null and normalizes to an empty map. The existing map is mutated
+     * in place so references obtained via [fields] observe the update.
+     *
+     * @throws IllegalArgumentException if fields is neither a Map nor null - the
+     *         Python type check is enforced statically by Kotlin's type system here.
+     */
+    fun setFields(newFields: Map<Int, Any>?) {
+        when (newFields) {
+            null -> fields.clear()
+            else -> {
+                val typed: Map<Int, Any> = newFields
+                fields.clear()
+                fields.putAll(typed)
+            }
+        }
+    }
+
+    /**
+     * Enforce Python's `set_destination` validation contract
+     * (LXMessage.py:235-242): reject non-SINGLE destinations and reassignment.
+     *
+     * Deviation (port-deviations.md "set_destination/set_source validation-only"):
+     * this port's `destination` is an immutable constructor property (`val`),
+     * so this method validates but cannot rebind.
+     *
+     * @throws IllegalArgumentException if destination is not a SINGLE-type Destination
+     * @throws IllegalStateException if the destination was already assigned
+     */
+    fun setDestination(destination: Destination?) {
+        if (this.destination != null) {
+            throw IllegalStateException("Cannot reassign destination on LXMessage")
+        }
+        if (destination == null || destination.type != DestinationType.SINGLE) {
+            throw IllegalArgumentException("Invalid destination set on LXMessage")
+        }
+    }
+
+    /**
+     * Enforce Python's `set_source` validation contract (LXMessage.py:255-262).
+     * See [setDestination] deviation note.
+     *
+     * @throws IllegalArgumentException if source is not a SINGLE-type Destination
+     * @throws IllegalStateException if the source was already assigned
+     */
+    fun setSource(source: Destination?) {
+        if (this.source != null) {
+            throw IllegalStateException("Cannot reassign source on LXMessage")
+        }
+        if (source == null || source.type != DestinationType.SINGLE) {
+            throw IllegalArgumentException("Invalid source set on LXMessage")
+        }
+    }
+
+    /**
+     * Set the delivery destination used by the router when handing off this
+     * message (Python `set_delivery_destination`, LXMessage.py:264-265).
+     */
+    fun setDeliveryDestination(deliveryDestination: Destination?) {
+        this.deliveryDestination = deliveryDestination
+    }
+
+    /**
+     * Register the callback fired when delivery is confirmed
+     * (Python `register_delivery_callback`, LXMessage.py:267-268).
+     */
+    fun registerDeliveryCallback(callback: ((LXMessage) -> Unit)?) {
+        deliveryCallback = callback
+    }
+
+    /**
+     * Register the callback fired when delivery definitively fails
+     * (Python `register_failed_callback`, LXMessage.py:270-271).
+     */
+    fun registerFailedCallback(callback: ((LXMessage) -> Unit)?) {
+        failedCallback = callback
+    }
+
+    /**
+     * Get or generate the propagation stamp for this message
+     * (Python `get_propagation_stamp`, LXMessage.py:329-353).
+     *
+     * Mirrors Python semantics:
+     * 1. If a propagation stamp already exists, return it immediately.
+     * 2. Record the node's target cost; raise if none configured.
+     * 3. Pack the message if needed so a transient ID exists.
+     * 4. Generate a proof-of-work stamp over the transient ID using the
+     *    propagation-node workblock expansion rounds (WORKBLOCK_EXPAND_ROUNDS_PN).
+     *
+     * @param targetCost Required stamp cost announced by the propagation node
+     * @return Stamp bytes, or null if generation did not produce a stamp
+     * @throws IllegalArgumentException if targetCost is not configured
+     */
+    suspend fun getPropagationStamp(targetCost: Int?): ByteArray? {
+        propagationStamp?.let { return it }
+
+        propagationTargetCost = targetCost
+        if (targetCost == null) {
+            throw IllegalArgumentException(
+                "Cannot generate propagation stamp without configured target propagation cost"
+            )
+        }
+
+        // Python relies on pack()'s PROPAGATED branch to populate transient_id
+        // (LXMessage.py:344 + 429-434); replicate via the dedicated helper so the
+        // transient ID exists regardless of desired_method.
+        if (transientId == null) {
+            pack()
+            if (computeTransientId() == null) {
+                throw IllegalStateException(
+                    "Cannot generate propagation stamp without a destination identity"
+                )
+            }
+        }
+
+        val result = LXStamper.generateStampWithWorkblock(
+            messageId = transientId!!,
+            stampCost = targetCost,
+            expandRounds = LXStamper.WORKBLOCK_EXPAND_ROUNDS_PN,
+        )
+        return if (result.stamp != null) {
+            propagationStamp = result.stamp
+            propagationStampValue = result.value
+            propagationStampValid = true
+            result.stamp
+        } else {
+            null
+        }
+    }
+
+    /**
+     * Compute the transient ID for propagation transfer: full hash of
+     * dest_hash + destination-encrypted packed payload
+     * (Python `pack()` PROPAGATED branch, LXMessage.py:429-434).
+     *
+     * @return The computed transient ID, also stored in [transientId]; null
+     *         when no destination identity is available for encryption
+     */
+    fun computeTransientId(): ByteArray? {
+        val dest = destination ?: return null
+        if (packed == null) pack()
+        val encryptedData =
+            dest.encrypt(packed!!.copyOfRange(LXMFConstants.DESTINATION_LENGTH, packed!!.size))
+        ratchetId = dest.latestRatchetId
+        val lxmfData = packed!!.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH) + encryptedData
+        transientId = Hashes.fullHash(lxmfData)
+        return transientId
+    }
+
+    /**
+     * Pack this message into its propagation-node wire container:
+     * `msgpack([timebase, [lxmf_data (+ propagation stamp)]])` where
+     * `lxmf_data = dest_hash + pn_encrypted_data (+ propagation_stamp)`
+     * (Python `pack()` PROPAGATED branch, LXMessage.py:426-444).
+     *
+     * Also determines PACKET vs RESOURCE representation from container size.
+     *
+     * @return Propagation-packed bytes, also stored in [propagationPacked];
+     *         null when no destination identity is available
+     */
+    fun packPropagation(): ByteArray? {
+        val dest = destination ?: return null
+        if (packed == null) pack()
+
+        var lxmfData =
+            packed!!.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH) +
+                dest.encrypt(packed!!.copyOfRange(LXMFConstants.DESTINATION_LENGTH, packed!!.size))
+        ratchetId = dest.latestRatchetId
+        transientId = Hashes.fullHash(lxmfData)
+        propagationStamp?.let { lxmfData += it }
+
+        val buffer = ByteArrayOutputStream()
+        MessagePack.newDefaultPacker(buffer).use { p ->
+            p.packArrayHeader(2)
+            p.packDouble(System.currentTimeMillis() / 1000.0)
+            p.packArrayHeader(1)
+            p.packBinaryHeader(lxmfData.size)
+            p.writePayload(lxmfData)
+        }
+
+        propagationPacked = buffer.toByteArray()
+        method = DeliveryMethod.PROPAGATED
+        representation =
+            if (propagationPacked!!.size <= LXMFConstants.LINK_PACKET_MAX_CONTENT) {
+                MessageRepresentation.PACKET
+            } else {
+                MessageRepresentation.RESOURCE
+            }
+        return propagationPacked
+    }
+
+    /**
+     * Determine whether the remote side supports compression by inspecting
+     * the remembered announce app-data for this destination
+     * (Python `determine_compression_support`, LXMessage.py:510-513).
+     * Defaults to true when no app-data is known, mirroring Python.
+     */
+    fun determineCompressionSupport() {
+        val appData = Identity.recallAppData(destinationHash)
+        autoCompress = if (appData != null && appData.isNotEmpty()) {
+            compressionSupportFromAppData(appData) ?: true
+        } else {
+            true
+        }
+    }
+
+    /**
+     * Parse the compression-support flag out of announce app-data
+     * (Python `compression_support_from_app_data`, LXMF.py:187-203).
+     *
+     * Version 0.5.0+ announces are msgpack lists whose third element, when
+     * present and itself a list, carries service flags; SF_COMPRESSION = 0x00.
+     * Returns null when app-data encodes "unknown" (null/empty), mirroring
+     * Python's None return.
+     */
+    fun compressionSupportFromAppData(appData: ByteArray?): Boolean? {
+        if (appData == null || appData.isEmpty()) return null
+
+        return try {
+            val unpacker = MessagePack.newDefaultUnpacker(appData)
+            val value = unpackValue(unpacker)
+            unpacker.close()
+
+            val peerData = value as? List<*>
+            if (peerData != null) {
+                if (peerData.size < 3) {
+                    true
+                } else {
+                    val flags = peerData[2] as? List<*>
+                    if (flags == null) {
+                        true
+                    } else {
+                        flags.any { f ->
+                            when (f) {
+                                is Byte -> f.toInt() == LXMFConstants.SF_COMPRESSION
+                                is Int -> f == LXMFConstants.SF_COMPRESSION
+                                is Long -> f.toInt() == LXMFConstants.SF_COMPRESSION
+                                else -> false
+                            }
+                        }
+                    }
+                }
+            } else {
+                true
+            }
+        } catch (e: Exception) {
+            // Original announce format or undecodable data - compression supported
+            true
+        }
+    }
+
+    /**
+     * Determine and annotate the transport encryption used for delivery based
+     * on the resolved delivery method and destination type
+     * (Python `determine_transport_encryption`, LXMessage.py:520-559).
+     */
+    fun determineTransportEncryption() {
+        val type = deliveryDestination?.type ?: destination?.type
+        when (method) {
+            DeliveryMethod.OPPORTUNISTIC, DeliveryMethod.PAPER -> when (type) {
+                DestinationType.SINGLE -> {
+                    transportEncrypted = true
+                    transportEncryption = LXMFConstants.ENCRYPTION_DESCRIPTION_EC
+                }
+                DestinationType.GROUP -> {
+                    transportEncrypted = true
+                    transportEncryption = LXMFConstants.ENCRYPTION_DESCRIPTION_AES
+                }
+                else -> {
+                    transportEncrypted = false
+                    transportEncryption = LXMFConstants.ENCRYPTION_DESCRIPTION_UNENCRYPTED
+                }
+            }
+            DeliveryMethod.DIRECT -> {
+                transportEncrypted = true
+                transportEncryption = LXMFConstants.ENCRYPTION_DESCRIPTION_EC
+            }
+            DeliveryMethod.PROPAGATED -> when (type) {
+                DestinationType.SINGLE -> {
+                    transportEncrypted = true
+                    transportEncryption = LXMFConstants.ENCRYPTION_DESCRIPTION_EC
+                }
+                DestinationType.GROUP -> {
+                    transportEncrypted = true
+                    transportEncryption = LXMFConstants.ENCRYPTION_DESCRIPTION_AES
+                }
+                else -> {
+                    transportEncrypted = false
+                    transportEncryption = LXMFConstants.ENCRYPTION_DESCRIPTION_UNENCRYPTED
+                }
+            }
+            else -> {
+                transportEncrypted = false
+                transportEncryption = LXMFConstants.ENCRYPTION_DESCRIPTION_UNENCRYPTED
+            }
+        }
+    }
+
+    /**
+     * Send this message over its established delivery path
+     * (Python `send`, LXMessage.py:463-508).
+     *
+     * Performs the pre-send annotations Python's `send()` makes - transport
+     * encryption determination and compression-support determination - then
+     * delegates packet/resource synthesis to the router-owned send hook wired
+     * by `LXMRouter` at registration time.
+     *
+     * Deviation (see port-deviations.md "LXMessage.send() delegates to LXMRouter"):
+     * direct Packet/Resource synthesis lives in `LXMRouter.sendViaLink` /
+     * opportunistic / propagation paths in this port. Without a registered hook,
+     * the message is marked FAILED and the failed callback fires instead of
+     * crashing on a missing delivery destination.
+     */
+    fun send(): Boolean {
+        determineTransportEncryption()
+        determineCompressionSupport()
+
+        val hook = routerSendHook
+        return if (hook != null) {
+            hook(this)
+        } else {
+            state = MessageState.FAILED
+            failedCallback?.invoke(this)
+            false
+        }
+    }
+
+    /** Internal hook wired by `LXMRouter` at registration time; null until then. */
+    internal var routerSendHook: ((LXMessage) -> Boolean)? = null
+
+    /**
+     * Serialize this message into a msgpack "container" suitable for persisting
+     * to disk (Python `packed_container`, LXMessage.py:660-672):
+     * `{state, lxmf_bytes, transport_encrypted, transport_encryption, method}`.
+     */
+    fun packedContainer(): ByteArray {
+        if (packed == null) {
+            pack()
+        }
+
+        val buffer = ByteArrayOutputStream()
+        MessagePack.newDefaultPacker(buffer).use { packer ->
+            packer.packMapHeader(5)
+            packer.packString("state")
+            packer.packInt(state.value)
+            packer.packString("lxmf_bytes")
+            val p = packed!!
+            packer.packBinaryHeader(p.size)
+            packer.writePayload(p)
+            packer.packString("transport_encrypted")
+            packer.packBoolean(transportEncrypted)
+            packer.packString("transport_encryption")
+            val enc = transportEncryption
+            if (enc != null) packer.packString(enc) else packer.packNil()
+            packer.packString("method")
+            val m = method
+            if (m != null) packer.packInt(m.value) else packer.packNil()
+        }
+        return buffer.toByteArray()
+    }
+
+    /**
+     * Atomically write this message's [packedContainer] to a directory named
+     * by the full message hash (Python `write_to_directory`, LXMessage.py:674-696).
+     * Writes to a temp file first and renames atomically, cleaning up on failure.
+     *
+     * @return Path of the written file, or null on failure
+     */
+    fun writeToDirectory(directoryPath: String): String? {
+        if (hash == null) {
+            println("$this cannot be written to directory before being packed")
+            return null
+        }
+
+        val fileName = hash!!.toHexString()
+        val filePath = "$directoryPath/$fileName"
+        val tmpPath =
+            "$filePath.tmp.${System.currentTimeMillis()}." +
+                ByteArray(8).also { java.security.SecureRandom().nextBytes(it) }.toHexString()
+
+        return try {
+            java.nio.file.Files.createDirectories(java.nio.file.Path.of(directoryPath))
+            java.nio.file.Files.write(java.nio.file.Path.of(tmpPath), packedContainer())
+            java.nio.file.Files.move(
+                java.nio.file.Path.of(tmpPath),
+                java.nio.file.Path.of(filePath),
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+            )
+            filePath
+        } catch (e: Exception) {
+            try {
+                java.nio.file.Files.deleteIfExists(java.nio.file.Path.of(tmpPath))
+            } catch (_: Exception) {}
+            println(
+                "Error while writing LXMF message to file \"$filePath\". " +
+                    "The contained exception was: $e"
+            )
+            null
+        }
+    }
+
+    /**
+     * Encode this message as a QR code image (Python `as_qr`, LXMessage.py:718-744).
+     *
+     * Requires a QR-code encoder on the classpath. The JVM core deliberately does
+     * NOT bundle a QR library - callers supply their own renderer using [asUri]
+     * output as the QR payload, matching Python where `qrcode` is optional and
+     * `as_qr()` returns None without it.
+     *
+     * @return Null always in core; mirrors Python's missing-module branch.
+     * @throws IllegalStateException if the message has no paper packing
+     */
+    fun asQr(): String? {
+        if (paperPacked == null) {
+            throw IllegalStateException(
+                "Attempt to represent LXM with non-paper delivery method as QR-code"
+            )
+        }
+        println(
+            "Generating QR-code representations of LXMs requires a \"qrcode\" renderer. " +
+                "Use asUri() output as the QR payload."
+        )
+        return null
     }
 
     override fun toString(): String {

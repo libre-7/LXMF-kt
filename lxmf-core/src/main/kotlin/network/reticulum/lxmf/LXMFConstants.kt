@@ -298,6 +298,19 @@ object LXMFConstants {
     /** URI schema for PAPER delivery */
     const val URI_SCHEMA = "lxm"
 
+
+    /** Service-flag bit for compression support in announce app data (Python LXMF.SF_COMPRESSION = 0x00) */
+    const val SF_COMPRESSION = 0x00
+
+    /** QR error correction level for paper messages (Python LXMessage.QR_ERROR_CORRECTION) */
+    const val QR_ERROR_CORRECTION = "ERROR_CORRECT_L"
+
+    /** Max storage of an ERROR_CORRECT_L QR code, bytes (Python LXMessage.QR_MAX_STORAGE) */
+    const val QR_MAX_STORAGE = 2953
+
+    /** Paper message max size: QR payload capacity of the URI (Python LXMessage.PAPER_MDU) */
+    const val PAPER_MDU = ((QR_MAX_STORAGE - (URI_SCHEMA.length + 3)) * 6) / 8
+
     // ===== Encryption Descriptions =====
 
     const val ENCRYPTION_DESCRIPTION_AES = "AES-128"
